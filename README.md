@@ -213,6 +213,6 @@ HARI PRIYA.B
 
 B.Sc. Computer Science with Artificial Intelligence
 
-⭐ Project
+ Project:
 
 If you find LectureLens useful, consider giving the repository a ⭐ on GitHub.
