@@ -1,23 +1,22 @@
+```python
 import streamlit as st
-import pytesseract
-from PIL import Image, ImageDraw, ImageFont
 import cv2
+import pytesseract
 import numpy as np
-import tempfile
 import os
-import shutil
 import re
 import textwrap
-from huggingface_hub import InferenceClient
+from PIL import Image, ImageDraw, ImageFont
+from google import genai
 
 
 # ============================================================
-# PAGE CONFIG
+# PAGE CONFIGURATION
 # ============================================================
 
 st.set_page_config(
-    page_title="LectureLens",
-    page_icon="🎓",
+    page_title="LectureLens - AI Revision Notes",
+    page_icon="📚",
     layout="wide"
 )
 
@@ -31,12 +30,24 @@ windows_tesseract = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 if os.path.exists(windows_tesseract):
     pytesseract.pytesseract.tesseract_cmd = windows_tesseract
 
-elif shutil.which("tesseract"):
-    pytesseract.pytesseract.tesseract_cmd = shutil.which("tesseract")
+
+# ============================================================
+# GEMINI CONFIGURATION
+# ============================================================
+
+try:
+    GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
+except Exception:
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+if GEMINI_API_KEY:
+    client = genai.Client(api_key=GEMINI_API_KEY)
+else:
+    client = None
 
 
 # ============================================================
-# CUSTOM UI
+# CUSTOM STYLING
 # ============================================================
 
 st.markdown(
@@ -44,17 +55,23 @@ st.markdown(
     <style>
 
     .main-title {
-        text-align: center;
-        font-size: 44px;
+        font-size: 42px;
         font-weight: 800;
+        text-align: center;
         margin-bottom: 5px;
     }
 
     .subtitle {
         text-align: center;
         font-size: 18px;
-        color: #64748B;
-        margin-bottom: 30px;
+        margin-bottom: 25px;
+    }
+
+    .info-box {
+        padding: 15px;
+        border-radius: 15px;
+        background-color: #f0f4ff;
+        margin-bottom: 15px;
     }
 
     </style>
@@ -64,58 +81,22 @@ st.markdown(
 
 
 # ============================================================
-# HEADER
+# TITLE
 # ============================================================
 
 st.markdown(
-    '<div class="main-title">🎓 LectureLens</div>',
+    '<div class="main-title">📚 LectureLens</div>',
     unsafe_allow_html=True
 )
 
 st.markdown(
-    '<div class="subtitle">'
-    'Transform lectures and documents into smart visual revision notes'
-    '</div>',
+    '<div class="subtitle">AI-Powered Lecture-to-Revision Notes Generator</div>',
     unsafe_allow_html=True
 )
 
-
-# ============================================================
-# SIDEBAR
-# ============================================================
-
-with st.sidebar:
-
-    st.header("⚙️ Settings")
-
-    frame_interval = st.slider(
-        "Video frame interval (seconds)",
-        min_value=2,
-        max_value=10,
-        value=4
-    )
-
-    st.info(
-        "For faster processing, use a short lecture video "
-        "during the demonstration."
-    )
-
-
-# ============================================================
-# FILE UPLOAD
-# ============================================================
-
-uploaded_file = st.file_uploader(
-    "📤 Upload an image or lecture video",
-    type=[
-        "png",
-        "jpg",
-        "jpeg",
-        "webp",
-        "mp4",
-        "mov",
-        "avi"
-    ]
+st.write(
+    "Upload a lecture image or video. LectureLens extracts visible text, "
+    "summarizes it using AI, and creates colourful revision notes."
 )
 
 
@@ -124,53 +105,53 @@ uploaded_file = st.file_uploader(
 # ============================================================
 
 def preprocess_image(image):
+    """
+    Preprocess image to improve OCR accuracy.
+    """
 
-    image = image.convert("RGB")
+    image_array = np.array(image)
 
-    img = np.array(image)
+    # Convert RGB to BGR
+    image_bgr = cv2.cvtColor(image_array, cv2.COLOR_RGB2BGR)
 
-    img = cv2.cvtColor(
-        img,
-        cv2.COLOR_RGB2BGR
-    )
+    # Convert to grayscale
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
 
-    gray = cv2.cvtColor(
-        img,
-        cv2.COLOR_BGR2GRAY
-    )
+    # Resize image
+    height, width = gray.shape
 
-    # Increase size for better OCR
-    gray = cv2.resize(
-        gray,
-        None,
-        fx=2,
-        fy=2,
-        interpolation=cv2.INTER_CUBIC
-    )
+    if width < 1500:
+        scale = 1500 / width
+        gray = cv2.resize(
+            gray,
+            None,
+            fx=scale,
+            fy=scale,
+            interpolation=cv2.INTER_CUBIC
+        )
 
     # Remove small noise
-    gray = cv2.GaussianBlur(
-        gray,
-        (3, 3),
-        0
-    )
+    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
 
-    # Convert to black and white
+    # Threshold
     _, threshold = cv2.threshold(
-        gray,
+        blurred,
         0,
         255,
         cv2.THRESH_BINARY + cv2.THRESH_OTSU
     )
 
-    return Image.fromarray(threshold)
+    return threshold
 
 
 # ============================================================
-# OCR IMAGE
+# IMAGE OCR
 # ============================================================
 
 def extract_text_from_image(image):
+    """
+    Extract text from an image using Tesseract OCR.
+    """
 
     processed = preprocess_image(image)
 
@@ -183,767 +164,496 @@ def extract_text_from_image(image):
 
 
 # ============================================================
-# OCR VIDEO
+# VIDEO OCR
 # ============================================================
 
-def extract_text_from_video(video_path, interval):
+def extract_text_from_video(video_path, interval_seconds=4):
+    """
+    Extract text from video frames.
+
+    The video itself is not directly read by OCR.
+    Frames are extracted at regular intervals and OCR
+    is applied to each frame.
+    """
 
     cap = cv2.VideoCapture(video_path)
 
     if not cap.isOpened():
-        return []
+        return ""
 
     fps = cap.get(cv2.CAP_PROP_FPS)
 
     if fps <= 0:
         fps = 30
 
-    frame_count = 0
-    next_capture = 0
+    frame_interval = int(fps * interval_seconds)
 
-    results = []
+    texts = []
+
+    frame_number = 0
+    last_text = ""
 
     while True:
 
-        success, frame = cap.read()
+        ret, frame = cap.read()
 
-        if not success:
+        if not ret:
             break
 
-        current_time = frame_count / fps
+        if frame_number % frame_interval == 0:
 
-        if current_time >= next_capture:
-
-            frame_rgb = cv2.cvtColor(
+            rgb_frame = cv2.cvtColor(
                 frame,
                 cv2.COLOR_BGR2RGB
             )
 
-            image = Image.fromarray(frame_rgb)
+            pil_image = Image.fromarray(rgb_frame)
 
-            text = extract_text_from_image(
-                image
-            )
+            text = extract_text_from_image(pil_image)
 
             if text:
 
-                results.append(
-                    {
-                        "time": current_time,
-                        "text": text
-                    }
-                )
+                # Normalize for duplicate comparison
+                normalized_current = re.sub(
+                    r"\s+",
+                    " ",
+                    text.lower()
+                ).strip()
 
-            next_capture += interval
+                normalized_previous = re.sub(
+                    r"\s+",
+                    " ",
+                    last_text.lower()
+                ).strip()
 
-        frame_count += 1
+                # Avoid duplicate slide text
+                if normalized_current != normalized_previous:
+
+                    texts.append(text)
+                    last_text = text
+
+        frame_number += 1
 
     cap.release()
 
-    return results
+    return "\n\n".join(texts)
 
 
 # ============================================================
-# REMOVE DUPLICATE VIDEO TEXT
+# GEMINI AI SUMMARIZATION
 # ============================================================
 
-def remove_duplicates(results):
+def generate_ai_summary(extracted_text):
+    """
+    Send OCR text to Gemini and generate structured
+    educational revision content.
+    """
 
-    cleaned = []
-
-    previous_text = ""
-
-    for item in results:
-
-        current = " ".join(
-            item["text"].split()
+    if not client:
+        raise Exception(
+            "GEMINI_API_KEY is missing. "
+            "Add GEMINI_API_KEY to Streamlit Secrets."
         )
-
-        previous = " ".join(
-            previous_text.split()
-        )
-
-        if not current:
-            continue
-
-        if current.lower() == previous.lower():
-            continue
-
-        cleaned.append(
-            {
-                "time": item["time"],
-                "text": current
-            }
-        )
-
-        previous_text = current
-
-    return cleaned
-
-
-# ============================================================
-# AI SUMMARY
-# ============================================================
-
-def generate_summary(text):
-
-    try:
-
-        token = st.secrets["HF_TOKEN"]
-
-    except Exception:
-
-        token = os.getenv(
-            "HF_TOKEN",
-            ""
-        )
-
-    if not token:
-
-        st.error(
-            "HF_TOKEN is missing. "
-            "Add it in Streamlit Secrets."
-        )
-
-        return None
-
-    client = InferenceClient(
-        api_key=token
-    )
 
     prompt = f"""
-You are LectureLens, an educational AI note-making assistant.
+You are an educational AI assistant.
 
-Analyze the following OCR-extracted lecture content.
-
-Create concise and accurate revision notes.
-
-Return ONLY these sections:
-
-TITLE:
-Give a short topic title.
-
-SUMMARY:
-Write a simple 3 to 5 sentence explanation.
-
-KEY POINTS:
-Give 4 to 6 important points.
-Each point should be a complete sentence.
-Do not use markdown headings.
-
-KEYWORDS:
-Give 5 to 8 important keywords separated by commas.
-
-QUICK REVISION:
-Write a short exam-oriented revision paragraph.
+Convert the following lecture text into concise,
+accurate revision notes for a college student.
 
 IMPORTANT:
-- Do not use # symbols.
-- Do not use markdown headings.
-- Do not use ** bold formatting.
-- Do not invent information.
-- Keep the language simple and student-friendly.
+- Use ONLY information present in the provided text.
+- Do not invent facts.
+- Keep the language simple and clear.
+- Do not use Markdown symbols such as #, *, or **.
+- Keep the answer structured exactly using the labels below.
 
-SOURCE CONTENT:
+Return exactly:
 
-{text[:15000]}
+TITLE:
+A short suitable title.
+
+SUMMARY:
+A concise paragraph explaining the main concept.
+
+KEY POINTS:
+1. First important point
+2. Second important point
+3. Third important point
+4. Fourth important point
+5. Fifth important point
+
+KEYWORDS:
+keyword1, keyword2, keyword3, keyword4, keyword5
+
+QUICK REVISION:
+A very short revision paragraph containing the most important things to remember.
+
+LECTURE TEXT:
+{extracted_text}
 """
 
-    try:
+    response = client.models.generate_content(
+        model="gemini-3.8-flash",
+        contents=prompt
+    )
 
-        response = client.chat.completions.create(
-            model="Qwen/Qwen2.5-72B-Instruct",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are an accurate educational "
-                        "summarization assistant."
-                    )
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            max_tokens=900,
-            temperature=0.3
-        )
+    if not response.text:
+        raise Exception("Gemini returned an empty response.")
 
-        return response.choices[0].message.content
-
-    except Exception as e:
-
-        st.error(
-            f"AI summarization failed: {e}"
-        )
-
-        return None
+    return response.text.strip()
 
 
 # ============================================================
-# FONT LOADER
+# PARSE AI RESPONSE
+# ============================================================
+
+def parse_summary(response):
+
+    result = {
+        "title": "Lecture Revision Notes",
+        "summary": "",
+        "key_points": [],
+        "keywords": [],
+        "quick_revision": ""
+    }
+
+    title_match = re.search(
+        r"TITLE:\s*(.*?)(?=\nSUMMARY:|\Z)",
+        response,
+        re.S | re.I
+    )
+
+    summary_match = re.search(
+        r"SUMMARY:\s*(.*?)(?=\nKEY POINTS:|\Z)",
+        response,
+        re.S | re.I
+    )
+
+    points_match = re.search(
+        r"KEY POINTS:\s*(.*?)(?=\nKEYWORDS:|\Z)",
+        response,
+        re.S | re.I
+    )
+
+    keywords_match = re.search(
+        r"KEYWORDS:\s*(.*?)(?=\nQUICK REVISION:|\Z)",
+        response,
+        re.S | re.I
+    )
+
+    revision_match = re.search(
+        r"QUICK REVISION:\s*(.*)",
+        response,
+        re.S | re.I
+    )
+
+    if title_match:
+        result["title"] = title_match.group(1).strip()
+
+    if summary_match:
+        result["summary"] = summary_match.group(1).strip()
+
+    if points_match:
+
+        points_text = points_match.group(1).strip()
+
+        points = re.findall(
+            r"(?:^|\n)\s*(?:\d+[\.\)]|-)\s*(.*)",
+            points_text
+        )
+
+        result["key_points"] = [
+            p.strip()
+            for p in points
+            if p.strip()
+        ]
+
+    if keywords_match:
+
+        keyword_text = keywords_match.group(1).strip()
+
+        result["keywords"] = [
+            k.strip()
+            for k in keyword_text.split(",")
+            if k.strip()
+        ]
+
+    if revision_match:
+        result["quick_revision"] = revision_match.group(1).strip()
+
+    return result
+
+
+# ============================================================
+# FONT FUNCTION
 # ============================================================
 
 def get_font(size, bold=False):
 
-    if bold:
+    font_paths = []
 
+    if bold:
         font_paths = [
             r"C:\Windows\Fonts\arialbd.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+            r"C:\Windows\Fonts\calibrib.ttf"
         ]
-
     else:
-
         font_paths = [
             r"C:\Windows\Fonts\arial.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+            r"C:\Windows\Fonts\calibri.ttf"
         ]
 
     for path in font_paths:
 
         if os.path.exists(path):
-
-            return ImageFont.truetype(
-                path,
-                size
-            )
+            return ImageFont.truetype(path, size)
 
     return ImageFont.load_default()
 
 
 # ============================================================
-# CLEAN AI TEXT
+# TEXT WRAPPING
 # ============================================================
 
-def clean_ai_text(text):
+def draw_wrapped_text(
+    draw,
+    text,
+    position,
+    font,
+    max_width,
+    line_spacing=8
+):
 
-    text = re.sub(
-        r"#{1,6}\s*",
-        "",
-        text
-    )
+    x, y = position
 
-    text = text.replace(
-        "**",
-        ""
-    )
+    words = text.split()
+    current_line = ""
 
-    text = text.replace(
-        "__",
-        ""
-    )
+    for word in words:
 
-    text = text.replace(
-        "`",
-        ""
-    )
+        test_line = (
+            current_line + " " + word
+        ).strip()
 
-    return text.strip()
+        bbox = draw.textbbox(
+            (0, 0),
+            test_line,
+            font=font
+        )
 
+        width = bbox[2] - bbox[0]
 
-# ============================================================
-# PARSE AI SUMMARY
-# ============================================================
-
-def parse_summary(summary):
-
-    title = "Lecture Revision Notes"
-
-    summary_text = ""
-
-    key_points = []
-
-    keywords = []
-
-    quick_revision = ""
-
-    current_section = ""
-
-    lines = summary.splitlines()
-
-    for line in lines:
-
-        line = line.strip()
-
-        if not line:
-            continue
-
-        line = clean_ai_text(line)
-
-        upper = line.upper()
-
-        if upper.startswith("TITLE:"):
-
-            title = line.split(
-                ":",
-                1
-            )[1].strip()
-
-            current_section = "title"
-
-        elif upper.startswith("SUMMARY:"):
-
-            current_section = "summary"
-
-            remaining = line.split(
-                ":",
-                1
-            )[1].strip()
-
-            if remaining:
-                summary_text += remaining + " "
-
-        elif upper.startswith("KEY POINTS:"):
-
-            current_section = "points"
-
-        elif upper.startswith("KEYWORDS:"):
-
-            current_section = "keywords"
-
-            remaining = line.split(
-                ":",
-                1
-            )[1].strip()
-
-            if remaining:
-
-                keywords.extend(
-                    [
-                        x.strip()
-                        for x in remaining.split(",")
-                        if x.strip()
-                    ]
-                )
-
-        elif upper.startswith("QUICK REVISION:"):
-
-            current_section = "revision"
-
-            remaining = line.split(
-                ":",
-                1
-            )[1].strip()
-
-            if remaining:
-                quick_revision += remaining + " "
+        if width <= max_width:
+            current_line = test_line
 
         else:
 
-            if current_section == "summary":
+            draw.text(
+                (x, y),
+                current_line,
+                font=font,
+                fill=(35, 35, 55)
+            )
 
-                summary_text += line + " "
+            y += (
+                bbox[3] - bbox[1]
+            ) + line_spacing
 
-            elif current_section == "points":
+            current_line = word
 
-                line = re.sub(
-                    r"^[-•*]\s*",
-                    "",
-                    line
-                )
+    if current_line:
 
-                if line:
-                    key_points.append(line)
+        draw.text(
+            (x, y),
+            current_line,
+            font=font,
+            fill=(35, 35, 55)
+        )
 
-            elif current_section == "keywords":
+        bbox = draw.textbbox(
+            (0, 0),
+            current_line,
+            font=font
+        )
 
-                parts = line.split(",")
+        y += (
+            bbox[3] - bbox[1]
+        ) + line_spacing
 
-                for part in parts:
-
-                    part = part.strip()
-
-                    if part:
-                        keywords.append(part)
-
-            elif current_section == "revision":
-
-                quick_revision += line + " "
-
-    return (
-        title.strip(),
-        summary_text.strip(),
-        key_points[:6],
-        keywords[:8],
-        quick_revision.strip()
-    )
+    return y
 
 
 # ============================================================
-# CREATE COLOURFUL INFOGRAPHIC
+# INFOGRAPHIC GENERATOR
 # ============================================================
 
-def create_notes_image(summary):
-
-    # --------------------------------------------------------
-    # Parse content
-    # --------------------------------------------------------
-
-    (
-        title,
-        summary_text,
-        key_points,
-        keywords,
-        quick_revision
-    ) = parse_summary(summary)
-
-    # --------------------------------------------------------
-    # Canvas
-    # --------------------------------------------------------
+def create_revision_image(data):
 
     width = 1400
-    height = 1900
+    height = 1800
 
     image = Image.new(
         "RGB",
         (width, height),
-        "#F6F8FC"
+        (248, 249, 255)
     )
 
     draw = ImageDraw.Draw(image)
 
-    # --------------------------------------------------------
-    # Colours
-    # --------------------------------------------------------
-
-    NAVY = "#172554"
-    BLUE = "#2563EB"
-    PURPLE = "#7C3AED"
-    CYAN = "#0891B2"
-    GREEN = "#059669"
-    ORANGE = "#EA580C"
-    RED = "#DC2626"
-
-    DARK = "#1E293B"
-    GREY = "#64748B"
-    WHITE = "#FFFFFF"
-
-    LIGHT_BLUE = "#EFF6FF"
-    LIGHT_PURPLE = "#F5F3FF"
-    LIGHT_GREEN = "#ECFDF5"
-    LIGHT_ORANGE = "#FFF7ED"
-    LIGHT_CYAN = "#ECFEFF"
-
-    # --------------------------------------------------------
     # Fonts
-    # --------------------------------------------------------
-
-    title_font = get_font(
-        52,
-        True
-    )
-
-    subtitle_font = get_font(
-        24,
-        True
-    )
-
-    section_font = get_font(
-        30,
-        True
-    )
-
-    body_font = get_font(
-        23,
-        False
-    )
-
-    small_font = get_font(
-        18,
-        False
-    )
-
-    number_font = get_font(
-        21,
-        True
-    )
-
-    keyword_font = get_font(
-        19,
-        True
-    )
+    title_font = get_font(48, bold=True)
+    section_font = get_font(30, bold=True)
+    body_font = get_font(24)
+    small_font = get_font(21)
 
     # --------------------------------------------------------
-    # Helper
-    # --------------------------------------------------------
-
-    def rounded_box(
-        x1,
-        y1,
-        x2,
-        y2,
-        fill,
-        radius=28
-    ):
-
-        draw.rounded_rectangle(
-            (
-                x1,
-                y1,
-                x2,
-                y2
-            ),
-            radius=radius,
-            fill=fill
-        )
-
-    # ========================================================
     # HEADER
-    # ========================================================
+    # --------------------------------------------------------
 
-    rounded_box(
-        45,
-        40,
-        width - 45,
-        275,
-        NAVY,
-        35
+    draw.rounded_rectangle(
+        (40, 35, width - 40, 190),
+        radius=30,
+        fill=(92, 75, 170)
     )
 
-    # Decorative circles
-
-    draw.ellipse(
-        (
-            width - 245,
-            60,
-            width - 105,
-            200
-        ),
-        fill=PURPLE
-    )
-
-    draw.ellipse(
-        (
-            width - 175,
-            135,
-            width - 75,
-            235
-        ),
-        fill=CYAN
-    )
+    title = data["title"]
 
     draw.text(
-        (90, 72),
-        "LECTURELENS",
-        font=subtitle_font,
-        fill="#BFDBFE"
-    )
-
-    # Title
-
-    title = title[:70]
-
-    title_lines = textwrap.wrap(
+        (80, 65),
         title,
-        width=31
+        font=title_font,
+        fill="white"
     )
 
-    title_y = 115
-
-    for line in title_lines[:2]:
-
-        draw.text(
-            (90, title_y),
-            line,
-            font=title_font,
-            fill=WHITE
-        )
-
-        title_y += 58
-
     draw.text(
-        (90, 225),
-        "AI-GENERATED REVISION NOTES",
+        (82, 125),
+        "LECTURELENS • AI REVISION NOTES",
         font=small_font,
-        fill="#CBD5E1"
+        fill="white"
     )
 
-    # ========================================================
-    # SUMMARY
-    # ========================================================
+    # --------------------------------------------------------
+    # SUMMARY CARD
+    # --------------------------------------------------------
 
-    y = 315
+    y = 230
 
-    rounded_box(
-        55,
-        y,
-        width - 55,
-        y + 285,
-        LIGHT_BLUE
-    )
-
-    draw.rectangle(
-        (
-            55,
-            y,
-            70,
-            y + 285
-        ),
-        fill=BLUE
+    draw.rounded_rectangle(
+        (40, y, width - 40, y + 280),
+        radius=25,
+        fill=(225, 239, 255)
     )
 
     draw.text(
-        (100, y + 30),
+        (75, y + 25),
         "SUMMARY",
         font=section_font,
-        fill=BLUE
+        fill=(45, 70, 130)
     )
 
-    summary_lines = textwrap.wrap(
-        summary_text,
-        width=82
+    draw_wrapped_text(
+        draw,
+        data["summary"],
+        (75, y + 80),
+        body_font,
+        width - 170
     )
 
-    text_y = y + 85
+    y += 315
 
-    for line in summary_lines[:7]:
-
-        draw.text(
-            (100, text_y),
-            line,
-            font=body_font,
-            fill=DARK
-        )
-
-        text_y += 34
-
-    # ========================================================
+    # --------------------------------------------------------
     # KEY POINTS
-    # ========================================================
+    # --------------------------------------------------------
 
-    y = y + 320
+    points = data["key_points"]
+
+    card_height = max(
+        100,
+        90 + len(points) * 75
+    )
+
+    draw.rounded_rectangle(
+        (40, y, width - 40, y + card_height),
+        radius=25,
+        fill=(255, 241, 220)
+    )
 
     draw.text(
-        (60, y),
-        "KEY CONCEPTS",
+        (75, y + 25),
+        "KEY POINTS",
         font=section_font,
-        fill=PURPLE
+        fill=(150, 90, 25)
     )
 
-    y += 62
+    point_y = y + 80
 
-    card_backgrounds = [
-        LIGHT_PURPLE,
-        LIGHT_BLUE,
-        LIGHT_GREEN,
-        LIGHT_ORANGE,
-        "#FEF2F2",
-        LIGHT_CYAN
-    ]
-
-    accents = [
-        PURPLE,
-        BLUE,
-        GREEN,
-        ORANGE,
-        RED,
-        CYAN
-    ]
-
-    for index, point in enumerate(key_points):
-
-        card_height = 112
-
-        rounded_box(
-            55,
-            y,
-            width - 55,
-            y + card_height,
-            card_backgrounds[
-                index % len(card_backgrounds)
-            ],
-            24
-        )
-
-        accent = accents[
-            index % len(accents)
-        ]
-
-        # Number circle
+    for index, point in enumerate(points, 1):
 
         draw.ellipse(
-            (
-                82,
-                y + 30,
-                128,
-                y + 76
-            ),
-            fill=accent
-        )
-
-        number_text = str(
-            index + 1
+            (75, point_y, 115, point_y + 40),
+            fill=(245, 166, 35)
         )
 
         draw.text(
-            (97, y + 35),
-            number_text,
-            font=number_font,
-            fill=WHITE
+            (89, point_y + 5),
+            str(index),
+            font=get_font(20, bold=True),
+            fill="white"
         )
 
-        # Point text
-
-        point_lines = textwrap.wrap(
+        draw_wrapped_text(
+            draw,
             point,
-            width=76
+            (135, point_y),
+            body_font,
+            width - 220,
+            line_spacing=5
         )
 
-        point_y = y + 22
+        point_y += 70
 
-        for line in point_lines[:2]:
+    y += card_height + 35
 
-            draw.text(
-                (155, point_y),
-                line,
-                font=body_font,
-                fill=DARK
-            )
-
-            point_y += 32
-
-        y += card_height + 15
-
-    # ========================================================
+    # --------------------------------------------------------
     # KEYWORDS
-    # ========================================================
+    # --------------------------------------------------------
 
-    y += 15
+    keyword_card_height = 180
 
-    draw.text(
-        (60, y),
-        "KEYWORDS",
-        font=section_font,
-        fill=CYAN
+    draw.rounded_rectangle(
+        (40, y, width - 40, y + keyword_card_height),
+        radius=25,
+        fill=(232, 248, 235)
     )
 
-    y += 55
+    draw.text(
+        (75, y + 25),
+        "KEYWORDS",
+        font=section_font,
+        fill=(45, 120, 70)
+    )
 
-    keyword_x = 60
+    keyword_y = y + 85
+    keyword_x = 75
 
-    keyword_y = y
+    for keyword in data["keywords"]:
 
-    for keyword in keywords:
-
-        keyword = keyword[:22]
+        keyword = keyword.strip()
 
         bbox = draw.textbbox(
             (0, 0),
             keyword,
-            font=keyword_font
+            font=small_font
         )
 
         keyword_width = (
             bbox[2] - bbox[0]
-        ) + 34
+        ) + 40
 
-        # Move to next line
+        if keyword_x + keyword_width > width - 75:
 
-        if keyword_x + keyword_width > width - 60:
-
-            keyword_x = 60
+            keyword_x = 75
             keyword_y += 55
 
         draw.rounded_rectangle(
@@ -951,372 +661,330 @@ def create_notes_image(summary):
                 keyword_x,
                 keyword_y,
                 keyword_x + keyword_width,
-                keyword_y + 40
+                keyword_y + 42
             ),
-            radius=18,
-            fill="#DFF7FA"
+            radius=20,
+            fill=(120, 190, 140)
         )
 
         draw.text(
-            (
-                keyword_x + 17,
-                keyword_y + 8
-            ),
+            (keyword_x + 20, keyword_y + 8),
             keyword,
-            font=keyword_font,
-            fill=CYAN
+            font=small_font,
+            fill="white"
         )
 
-        keyword_x += keyword_width + 10
+        keyword_x += keyword_width + 12
 
-    # ========================================================
+    y += keyword_card_height + 35
+
+    # --------------------------------------------------------
     # QUICK REVISION
-    # ========================================================
+    # --------------------------------------------------------
 
-    keyword_bottom = keyword_y + 50
+    revision_height = 300
 
-    y = keyword_bottom + 25
-
-    rounded_box(
-        55,
-        y,
-        width - 55,
-        y + 240,
-        LIGHT_GREEN,
-        28
-    )
-
-    draw.rectangle(
-        (
-            55,
-            y,
-            70,
-            y + 240
-        ),
-        fill=GREEN
+    draw.rounded_rectangle(
+        (40, y, width - 40, y + revision_height),
+        radius=25,
+        fill=(248, 229, 250)
     )
 
     draw.text(
-        (100, y + 30),
+        (75, y + 25),
         "QUICK REVISION",
         font=section_font,
-        fill=GREEN
+        fill=(135, 65, 145)
     )
 
-    revision_lines = textwrap.wrap(
-        quick_revision,
-        width=82
+    draw_wrapped_text(
+        draw,
+        data["quick_revision"],
+        (75, y + 85),
+        body_font,
+        width - 170
     )
 
-    revision_y = y + 85
-
-    for line in revision_lines[:5]:
-
-        draw.text(
-            (100, revision_y),
-            line,
-            font=body_font,
-            fill=DARK
-        )
-
-        revision_y += 34
-
-    # ========================================================
+    # --------------------------------------------------------
     # FOOTER
-    # ========================================================
+    # --------------------------------------------------------
 
     draw.text(
-        (60, height - 48),
-        "LectureLens  •  Learn smarter  •  Revise faster",
+        (75, height - 70),
+        "Generated by LectureLens • OCR + Gemini AI + Pillow",
         font=small_font,
-        fill=GREY
+        fill=(100, 100, 120)
     )
 
     return image
 
 
 # ============================================================
-# MAIN APPLICATION
+# SIDEBAR
 # ============================================================
 
-if uploaded_file:
+with st.sidebar:
 
-    file_name = uploaded_file.name.lower()
+    st.header("⚙️ LectureLens")
 
-    st.divider()
+    input_type = st.radio(
+        "Choose input type",
+        ["Lecture Image", "Lecture Video"]
+    )
 
-    # ========================================================
-    # IMAGE INPUT
-    # ========================================================
+    if input_type == "Lecture Video":
 
-    if file_name.endswith(
-        (
-            ".png",
-            ".jpg",
-            ".jpeg",
-            ".webp"
-        )
-    ):
-
-        image = Image.open(
-            uploaded_file
+        interval = st.slider(
+            "Frame interval (seconds)",
+            min_value=2,
+            max_value=10,
+            value=4
         )
 
-        st.subheader(
-            "📷 Uploaded Image"
-        )
+    st.markdown("---")
+
+    st.info(
+        "LectureLens uses Tesseract OCR for text extraction, "
+        "Gemini for AI summarization and Pillow for visual "
+        "revision-note generation."
+    )
+
+
+# ============================================================
+# IMAGE INPUT
+# ============================================================
+
+if input_type == "Lecture Image":
+
+    uploaded_file = st.file_uploader(
+        "Upload Lecture Image",
+        type=["png", "jpg", "jpeg"]
+    )
+
+    if uploaded_file:
+
+        image = Image.open(uploaded_file).convert("RGB")
 
         st.image(
             image,
+            caption="Uploaded Lecture Image",
             use_container_width=True
         )
 
         if st.button(
-            "🚀 Extract & Summarize",
-            type="primary"
+            "✨ Generate Revision Notes",
+            use_container_width=True
         ):
 
             with st.spinner(
-                "Reading image with OCR..."
+                "🔍 Extracting text using OCR..."
             ):
 
-                extracted_text = (
-                    extract_text_from_image(
-                        image
-                    )
+                extracted_text = extract_text_from_image(
+                    image
                 )
 
             if not extracted_text:
 
-                st.warning(
-                    "No readable text was detected."
+                st.error(
+                    "No readable text was detected in the image."
                 )
 
             else:
 
-                st.subheader(
-                    "🔎 Extracted Text"
-                )
+                with st.expander("🔎 Extracted OCR Text"):
 
-                st.text_area(
-                    "OCR Result",
-                    extracted_text,
-                    height=250
-                )
+                    st.write(extracted_text)
 
-                with st.spinner(
-                    "Creating AI revision notes..."
-                ):
+                try:
 
-                    summary = generate_summary(
-                        extracted_text
-                    )
+                    with st.spinner(
+                        "🧠 Gemini is creating your revision notes..."
+                    ):
 
-                if summary:
-
-                    st.subheader(
-                        "🤖 AI Summary"
-                    )
-
-                    st.markdown(
-                        summary
-                    )
-
-                    # Create colourful infographic
-
-                    notes_image = (
-                        create_notes_image(
-                            summary
+                        ai_response = generate_ai_summary(
+                            extracted_text
                         )
+
+                    summary_data = parse_summary(
+                        ai_response
                     )
 
-                    st.subheader(
-                        "🎨 AI-Generated Visual Revision Notes"
+                    with st.spinner(
+                        "🎨 Creating colourful revision notes..."
+                    ):
+
+                        revision_image = create_revision_image(
+                            summary_data
+                        )
+
+                    st.success(
+                        "🎉 Revision notes generated successfully!"
                     )
 
                     st.image(
-                        notes_image,
+                        revision_image,
+                        caption="AI Revision Notes",
                         use_container_width=True
                     )
 
-                    # Save image
+                    # Convert image to bytes
+                    from io import BytesIO
 
-                    image_path = os.path.join(
-                        tempfile.gettempdir(),
-                        "LectureLens_Notes.png"
+                    image_bytes = BytesIO()
+
+                    revision_image.save(
+                        image_bytes,
+                        format="PNG"
                     )
 
-                    notes_image.save(
-                        image_path
+                    st.download_button(
+                        label="⬇️ Download Revision Notes",
+                        data=image_bytes.getvalue(),
+                        file_name="LectureLens_Revision_Notes.png",
+                        mime="image/png",
+                        use_container_width=True
                     )
 
-                    with open(
-                        image_path,
-                        "rb"
-                    ) as file:
+                except Exception as e:
 
-                        st.download_button(
-                            label="⬇️ Download Revision Notes",
-                            data=file,
-                            file_name="LectureLens_Revision_Notes.png",
-                            mime="image/png"
-                        )
+                    st.error(
+                        f"AI summarization failed: {e}"
+                    )
 
 
-    # ========================================================
-    # VIDEO INPUT
-    # ========================================================
+# ============================================================
+# VIDEO INPUT
+# ============================================================
 
-    elif file_name.endswith(
-        (
-            ".mp4",
-            ".mov",
-            ".avi"
-        )
-    ):
+else:
 
-        st.subheader(
-            "🎥 Uploaded Lecture"
-        )
+    uploaded_video = st.file_uploader(
+        "Upload Lecture Video",
+        type=["mp4", "mov", "avi", "mkv"]
+    )
 
-        st.video(
-            uploaded_file
-        )
+    if uploaded_video:
+
+        st.video(uploaded_video)
 
         if st.button(
-            "🚀 Analyze Lecture",
-            type="primary"
+            "🎬 Process Lecture Video",
+            use_container_width=True
         ):
 
-            temp_video = tempfile.NamedTemporaryFile(
-                delete=False,
-                suffix=os.path.splitext(
-                    uploaded_file.name
-                )[1]
-            )
+            temp_video_path = None
 
-            temp_video.write(
-                uploaded_file.getbuffer()
-            )
+            try:
 
-            temp_video.close()
+                import tempfile
 
-            with st.spinner(
-                "Extracting lecture frames and reading text..."
-            ):
+                with tempfile.NamedTemporaryFile(
+                    delete=False,
+                    suffix=".mp4"
+                ) as temp_video:
 
-                results = extract_text_from_video(
-                    temp_video.name,
-                    frame_interval
-                )
-
-            os.unlink(
-                temp_video.name
-            )
-
-            results = remove_duplicates(
-                results
-            )
-
-            if not results:
-
-                st.warning(
-                    "No readable text was detected "
-                    "in the video."
-                )
-
-            else:
-
-                st.success(
-                    f"Detected readable content "
-                    f"from {len(results)} lecture frames."
-                )
-
-                st.subheader(
-                    "⏱️ Timestamped Lecture Text"
-                )
-
-                combined_text = ""
-
-                for item in results:
-
-                    minutes = int(
-                        item["time"] // 60
+                    temp_video.write(
+                        uploaded_video.read()
                     )
 
-                    seconds = int(
-                        item["time"] % 60
-                    )
-
-                    timestamp = (
-                        f"{minutes:02d}:{seconds:02d}"
-                    )
-
-                    st.markdown(
-                        f"**⏱️ {timestamp}**"
-                    )
-
-                    st.write(
-                        item["text"]
-                    )
-
-                    combined_text += (
-                        f"[{timestamp}] "
-                        f"{item['text']}\n"
-                    )
+                    temp_video_path = temp_video.name
 
                 with st.spinner(
-                    "Creating AI lecture summary..."
+                    "🎞️ Extracting lecture frames and reading text..."
                 ):
 
-                    summary = generate_summary(
-                        combined_text
+                    extracted_text = extract_text_from_video(
+                        temp_video_path,
+                        interval_seconds=interval
                     )
 
-                if summary:
+                if not extracted_text:
 
-                    st.subheader(
-                        "🤖 AI Lecture Summary"
+                    st.error(
+                        "No readable text was detected in the video."
                     )
 
-                    st.markdown(
-                        summary
-                    )
+                else:
 
-                    # Create colourful infographic
+                    with st.expander(
+                        "🔎 Extracted Video OCR Text"
+                    ):
 
-                    notes_image = (
-                        create_notes_image(
-                            summary
+                        st.write(extracted_text)
+
+                    with st.spinner(
+                        "🧠 Gemini is creating revision notes..."
+                    ):
+
+                        ai_response = generate_ai_summary(
+                            extracted_text
                         )
+
+                    summary_data = parse_summary(
+                        ai_response
                     )
 
-                    st.subheader(
-                        "🎨 AI-Generated Visual Revision Notes"
+                    with st.spinner(
+                        "🎨 Creating colourful revision notes..."
+                    ):
+
+                        revision_image = create_revision_image(
+                            summary_data
+                        )
+
+                    st.success(
+                        "🎉 Video revision notes generated successfully!"
                     )
 
                     st.image(
-                        notes_image,
+                        revision_image,
+                        caption="AI Revision Notes",
                         use_container_width=True
                     )
 
-                    image_path = os.path.join(
-                        tempfile.gettempdir(),
-                        "LectureLens_Lecture_Notes.png"
+                    from io import BytesIO
+
+                    image_bytes = BytesIO()
+
+                    revision_image.save(
+                        image_bytes,
+                        format="PNG"
                     )
 
-                    notes_image.save(
-                        image_path
+                    st.download_button(
+                        label="⬇️ Download Revision Notes",
+                        data=image_bytes.getvalue(),
+                        file_name="LectureLens_Video_Revision_Notes.png",
+                        mime="image/png",
+                        use_container_width=True
                     )
 
-                    with open(
-                        image_path,
-                        "rb"
-                    ) as file:
+            except Exception as e:
 
-                        st.download_button(
-                            label="⬇️ Download Lecture Notes",
-                            data=file,
-                            file_name="LectureLens_Lecture_Notes.png",
-                            mime="image/png"
-                        )
+                st.error(
+                    f"Video processing failed: {e}"
+                )
+
+            finally:
+
+                if temp_video_path and os.path.exists(
+                    temp_video_path
+                ):
+
+                    try:
+                        os.remove(temp_video_path)
+                    except:
+                        pass
+
+
+# ============================================================
+# FOOTER
+# ============================================================
+
+st.markdown("---")
+
+st.caption(
+    "LectureLens | OCR + OpenCV + Gemini AI + Pillow + Streamlit"
+)
+```
