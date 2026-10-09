@@ -3,4 +3,4 @@ opencv-python-headless
 pytesseract
 pillow
 numpy
-huggingface_hub
+google-genai
