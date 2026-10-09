@@ -987,4 +987,3 @@ st.markdown("---")
 st.caption(
     "LectureLens | OCR + OpenCV + Gemini AI + Pillow + Streamlit"
 )
-```
